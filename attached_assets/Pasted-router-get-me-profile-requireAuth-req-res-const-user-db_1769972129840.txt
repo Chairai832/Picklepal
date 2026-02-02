@@ -1,0 +1,169 @@
+router.get("/me/profile", requireAuth, (req, res) => {
+  const user = db.prepare(`
+    SELECT id, email, name, role, level, reliability_pct
+    FROM users
+    WHERE id = ?
+  `).get(req.user.id);
+
+  // Matches participated in (finalized competitive only)
+  const matches = db.prepare(`
+    SELECT
+      m.id,
+      m.title,
+      m.starts_at,
+      m.status,
+      m.competitive,
+      m.result_json,
+      mp.team,
+      v.city,
+      v.name as venue_name,
+      c.name as court_name
+    FROM match_players mp
+    JOIN matches m ON m.id = mp.match_id
+    JOIN courts c ON c.id = m.court_id
+    JOIN venues v ON v.id = c.venue_id
+    WHERE mp.user_id = ?
+      AND m.status = 'finalized'
+    ORDER BY m.starts_at DESC
+    LIMIT 30
+  `).all(req.user.id);
+
+  // Simple win/loss/tie count for the player's team
+  let wins = 0, losses = 0, ties = 0;
+  const parsed = matches.map((m) => {
+    let winnerTeam = null;
+    try {
+      winnerTeam = m.result_json ? JSON.parse(m.result_json).winnerTeam : null;
+    } catch {}
+    const outcome =
+      winnerTeam === "tie" ? "tie" :
+      winnerTeam === m.team ? "win" :
+      (winnerTeam ? "loss" : "unknown");
+
+    if (outcome === "win") wins++;
+    else if (outcome === "loss") losses++;
+    else if (outcome === "tie") ties++;
+
+    return {
+      id: m.id,
+      title: m.title,
+      startsAt: m.starts_at,
+      city: m.city,
+      venueName: m.venue_name,
+      courtName: m.court_name,
+      team: m.team,
+      competitive: !!m.competitive,
+      outcome,
+    };
+  });
+
+  res.json({
+    user: {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      dur: user.level,                 // DUR is just your level field
+      reliabilityPct: user.reliability_pct,
+    },
+    stats: { wins, losses, ties, total: wins + losses + ties },
+    recentMatches: parsed,
+  });
+});
+Frontend: add API function
+In client/src/lib/api.js, add:
+
+js
+Copy code
+meProfile: () => request("/me/profile"),
+Frontend: add Profile page
+Create: client/src/pages/Profile.jsx
+
+jsx
+Copy code
+import React, { useEffect, useState } from "react";
+import { api, getUser } from "../lib/api";
+
+export default function Profile() {
+  const sessionUser = getUser();
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState("");
+
+  async function load() {
+    setErr("");
+    try {
+      const d = await api.meProfile();
+      setData(d);
+    } catch (e) {
+      setErr(e.message);
+    }
+  }
+
+  useEffect(() => { load(); }, []);
+
+  if (!sessionUser) {
+    return (
+      <div className="card">
+        <h2 className="cardTitle">Profile</h2>
+        <p className="muted">Please login to view your DUR rating.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="grid">
+      <div className="col-12 card">
+        <h2 className="cardTitle">My Profile</h2>
+        <p className="muted">Your DUR rating updates after finalized competitive matches.</p>
+
+        {err && <div className="error">{err}</div>}
+        {!data ? (
+          <p className="muted">Loading…</p>
+        ) : (
+          <>
+            <div className="hr" />
+            <div className="kpi">
+              <span className="pill"><b>DUR</b>: {Number(data.user.dur).toFixed(3)}</span>
+              <span className="pill"><b>Reliability</b>: {data.user.reliabilityPct}%</span>
+              <span className="pill"><b>Record</b>: {data.stats.wins}-{data.stats.losses}-{data.stats.ties}</span>
+            </div>
+
+            <div className="hr" />
+            <h3 className="cardTitle">Recent competitive matches</h3>
+
+            {data.recentMatches.length === 0 ? (
+              <p className="muted">No finalized matches yet. Join or create a competitive match.</p>
+            ) : (
+              <div className="grid">
+                {data.recentMatches.map((m) => (
+                  <div key={m.id} className="col-6 card">
+                    <h3 className="cardTitle">{m.title}</h3>
+                    <p className="muted">
+                      {m.city} • {m.venueName} • {m.courtName}<br />
+                      {new Date(m.startsAt).toLocaleString()} • Team {m.team} • <b>{m.outcome}</b>
+                    </p>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+Add route + navbar link
+In client/src/App.jsx import + route:
+jsx
+Copy code
+import Profile from "./pages/Profile.jsx";
+Add route:
+
+jsx
+Copy code
+<Route path="/profile" element={<RequireAuth><Profile /></RequireAuth>} />
+In client/src/components/Navbar.jsx add link:
+Add this alongside Bookings:
+
+jsx
+Copy code
+{user && <NavLink to="/profile" className={({isActive}) => "navLink " + (isActive ? "active" : "")}>Profile</NavLink>}

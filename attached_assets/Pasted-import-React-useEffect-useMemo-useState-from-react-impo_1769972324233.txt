@@ -1,0 +1,429 @@
+import React, { useEffect, useMemo, useState } from "react";
+import { api, getUser } from "../lib/api";
+import { useNavigate } from "react-router-dom";
+
+function todayISO() {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function isoFromLocal(date, time) {
+  return new Date(`${date}T${time}:00`).toISOString();
+}
+
+function isoDate(iso) {
+  try {
+    return new Date(iso).toISOString().slice(0, 10);
+  } catch {
+    return "";
+  }
+}
+
+function isPast(iso) {
+  try {
+    return new Date(iso).getTime() < Date.now();
+  } catch {
+    return false;
+  }
+}
+
+function whatsappMessage(match) {
+  const when = new Date(match.startsAt).toLocaleString();
+  const openSpots = Math.max(0, 4 - (match.players?.length || 0));
+  const teamA = (match.players || []).filter((p) => p.team === "A").map((p) => p.name).join(", ") || "—";
+  const teamB = (match.players || []).filter((p) => p.team === "B").map((p) => p.name).join(", ") || "—";
+
+  // If you later add a public invite link, replace this with a real URL.
+  return [
+    `🏓 Match Point — Open Pickleball Doubles`,
+    ``,
+    `📌 ${match.city} • ${match.venueName} • ${match.courtName}`,
+    `🕒 ${when}`,
+    `🎯 Skill: ${match.skill}`,
+    `👥 Open spots: ${openSpots}/4`,
+    ``,
+    `Team A: ${teamA}`,
+    `Team B: ${teamB}`,
+    ``,
+    `Join in the Match Point app:`,
+    `Open Matches → find "${match.title}"`,
+  ].join("\n");
+}
+
+async function copyToClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    // fallback
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  }
+}
+
+export default function Matches() {
+  const user = getUser();
+  const nav = useNavigate();
+
+  const [meta, setMeta] = useState(null);
+  const [courts, setCourts] = useState([]);
+  const [matches, setMatches] = useState([]);
+  const [err, setErr] = useState("");
+  const [toast, setToast] = useState("");
+
+  // create form
+  const [createCity, setCreateCity] = useState("");
+  const [courtId, setCourtId] = useState("");
+  const [title, setTitle] = useState("Open Pickleball Doubles");
+  const [skill, setSkill] = useState("Beginner");
+  const [date, setDate] = useState(todayISO());
+  const [time, setTime] = useState("19:00");
+  const [openSpots, setOpenSpots] = useState(3);
+
+  // filters
+  const [filterCity, setFilterCity] = useState("");
+  const [filterSkill, setFilterSkill] = useState("");
+  const [filterDate, setFilterDate] = useState("");
+  const [openOnly, setOpenOnly] = useState(true);
+  const [showPast, setShowPast] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      const m = await api.meta();
+      setMeta(m);
+      setCreateCity(m.cities[0]);
+      setFilterCity(m.cities[0]);
+      setSkill(m.skills[0]);
+      setFilterSkill("");
+      setFilterDate("");
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!createCity) return;
+    (async () => {
+      const c = await api.courts(createCity);
+      setCourts(c);
+      setCourtId(c[0]?.id || "");
+    })();
+  }, [createCity]);
+
+  async function loadMatches() {
+    setErr("");
+    try {
+      const rows = await api.matches();
+      setMatches(rows);
+    } catch (e) {
+      setErr(e.message);
+    }
+  }
+
+  useEffect(() => {
+    loadMatches();
+  }, []);
+
+  // auto-clear toast
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(""), 1800);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  const filteredMatches = useMemo(() => {
+    const rows = [...matches];
+
+    const out = rows
+      .filter((m) => (filterCity ? m.city === filterCity : true))
+      .filter((m) => (filterSkill ? m.skill === filterSkill : true))
+      .filter((m) => (filterDate ? isoDate(m.startsAt) === filterDate : true))
+      .filter((m) => (showPast ? true : !isPast(m.startsAt)))
+      .filter((m) => {
+        if (!openOnly) return true;
+        const filled = (m.players || []).length;
+        return filled < 4 && m.status === "scheduled";
+      })
+      .sort((a, b) => new Date(a.startsAt).getTime() - new Date(b.startsAt).getTime());
+
+    return out;
+  }, [matches, filterCity, filterSkill, filterDate, openOnly, showPast]);
+
+  async function create() {
+    setErr("");
+    if (!user) return setErr("Please login to create a match.");
+    try {
+      await api.createMatch({
+        courtId,
+        title,
+        skill,
+        startsAt: isoFromLocal(date, time),
+        needPlayers: Number(openSpots),
+      });
+      await loadMatches();
+      setToast("Match created!");
+    } catch (e) {
+      setErr(e.message);
+    }
+  }
+
+  async function join(id) {
+    setErr("");
+    if (!user) return setErr("Please login to join.");
+    try {
+      await api.joinMatch(id);
+      await loadMatches();
+      setToast("Joined match!");
+    } catch (e) {
+      setErr(e.message);
+    }
+  }
+
+  async function setTeamsSimple(m) {
+    const ids = (m.players || []).map((p) => p.id);
+    if (ids.length !== 4) return;
+    await api.setTeams(m.id, { teamA: [ids[0], ids[1]], teamB: [ids[2], ids[3]] });
+    await loadMatches();
+    setToast("Teams set!");
+  }
+
+  async function complete(m, winnerTeam) {
+    setErr("");
+    if (!user) return setErr("Please login.");
+    try {
+      const sets =
+        winnerTeam === "A"
+          ? [[11, 8], [9, 11], [11, 6]]
+          : winnerTeam === "B"
+          ? [[8, 11], [11, 9], [6, 11]]
+          : [[11, 9], [9, 11]];
+
+      await api.completeMatch(m.id, {
+        competitive: true,
+        sets,
+        winnerTeam,
+      });
+
+      await loadMatches();
+      nav(`/rate/${m.id}`);
+    } catch (e) {
+      setErr(e.message);
+    }
+  }
+
+  async function share(m) {
+    const msg = whatsappMessage(m);
+    const ok = await copyToClipboard(msg);
+    if (ok) setToast("Copied invite message!");
+    else setToast("Copy failed — please copy manually.");
+  }
+
+  return (
+    <div className="grid">
+      <div className="col-12 card">
+        <h2 className="cardTitle">Open matches (Doubles)</h2>
+        <p className="muted">
+          Find games fast. Create a match, share it to WhatsApp, and play.
+        </p>
+
+        {toast && <div className="success">{toast}</div>}
+        {err && <div className="error">{err}</div>}
+
+        <div className="hr" />
+
+        {/* FILTERS */}
+        <div className="grid">
+          <div className="col-3">
+            <label className="muted">City</label>
+            <select className="select" value={filterCity} onChange={(e) => setFilterCity(e.target.value)}>
+              {meta?.cities?.map((c) => <option key={c} value={c}>{c}</option>)}
+            </select>
+          </div>
+
+          <div className="col-3">
+            <label className="muted">Skill</label>
+            <select className="select" value={filterSkill} onChange={(e) => setFilterSkill(e.target.value)}>
+              <option value="">All</option>
+              {meta?.skills?.map((s) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+
+          <div className="col-3">
+            <label className="muted">Date</label>
+            <input className="input" type="date" value={filterDate} onChange={(e) => setFilterDate(e.target.value)} />
+          </div>
+
+          <div className="col-3">
+            <label className="muted"> </label>
+            <div className="row">
+              <button className={"button " + (openOnly ? "" : "secondary")} onClick={() => setOpenOnly(v => !v)}>
+                {openOnly ? "Open only" : "Showing all"}
+              </button>
+              <button className="button secondary" onClick={() => setShowPast(v => !v)}>
+                {showPast ? "Hide past" : "Show past"}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div className="hr" />
+
+        {/* CREATE */}
+        <h3 className="cardTitle">Create a match</h3>
+        <div className="grid">
+          <div className="col-3">
+            <label className="muted">City</label>
+            <select className="select" value={createCity} onChange={(e) => setCreateCity(e.target.value)}>
+              {meta?.cities?.map((c) => <option key={c} value={c}>{c}</option>)}
+            </select>
+          </div>
+
+          <div className="col-6">
+            <label className="muted">Court</label>
+            <select className="select" value={courtId} onChange={(e) => setCourtId(e.target.value)}>
+              {courts.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name} — {c.venue.name} ({c.indoor ? "Indoor" : "Outdoor"})
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="col-3">
+            <label className="muted">Skill</label>
+            <select className="select" value={skill} onChange={(e) => setSkill(e.target.value)}>
+              {meta?.skills?.map((s) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+
+          <div className="col-6">
+            <label className="muted">Title</label>
+            <input className="input" value={title} onChange={(e) => setTitle(e.target.value)} />
+          </div>
+
+          <div className="col-3">
+            <label className="muted">Date</label>
+            <input className="input" type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+          </div>
+
+          <div className="col-3">
+            <label className="muted">Time</label>
+            <input className="input" type="time" value={time} onChange={(e) => setTime(e.target.value)} />
+          </div>
+
+          <div className="col-3">
+            <label className="muted">Open spots</label>
+            <input
+              className="input"
+              type="number"
+              min="0"
+              max="3"
+              value={openSpots}
+              onChange={(e) => setOpenSpots(e.target.value)}
+            />
+          </div>
+
+          <div className="col-9">
+            <label className="muted"> </label>
+            <div className="row">
+              <button className="button" onClick={create}>Create</button>
+              <button className="button secondary" onClick={loadMatches}>Refresh</button>
+              <span className="pill">{user ? `Logged in: ${user.name}` : "Not logged in"}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* MATCH LIST */}
+      {filteredMatches.length === 0 ? (
+        <div className="col-12 card">
+          <h3 className="cardTitle">No matches found</h3>
+          <p className="muted">Try changing filters or create a match and share it to WhatsApp.</p>
+        </div>
+      ) : (
+        filteredMatches.map((m) => {
+          const players = m.players || [];
+          const filled = players.length;
+          const open = Math.max(0, 4 - filled);
+
+          const isHost = user && m.hostName === user.name;
+          const isJoined = user ? players.some((p) => p.name === user.name) : false;
+          const isFull = filled === 4;
+
+          const teamA = players.filter((p) => p.team === "A");
+          const teamB = players.filter((p) => p.team === "B");
+
+          return (
+            <div key={m.id} className="col-6 card">
+              <div className="row" style={{ justifyContent: "space-between" }}>
+                <h3 className="cardTitle" style={{ margin: 0 }}>{m.title}</h3>
+                <span className="pill">{open}/4 open</span>
+              </div>
+
+              <p className="muted">
+                {m.city} • {m.venueName} • {m.courtName}<br />
+                {new Date(m.startsAt).toLocaleString()}
+              </p>
+
+              <div className="pillRow">
+                <span className="pill">{m.skill}</span>
+                <span className="pill">Host: {m.hostName}</span>
+                <span className="pill">Status: {m.status}</span>
+              </div>
+
+              <div className="hr" />
+
+              <p className="muted" style={{ marginTop: 0 }}>
+                <b>Team A</b>: {teamA.map((p) => p.name).join(", ") || "—"}<br />
+                <b>Team B</b>: {teamB.map((p) => p.name).join(", ") || "—"}
+              </p>
+
+              <div className="row">
+                <button className="button secondary" onClick={() => share(m)}>
+                  Copy WhatsApp invite
+                </button>
+
+                {!isJoined && m.status === "scheduled" && (
+                  <button className="button" onClick={() => join(m.id)} disabled={filled >= 4}>
+                    Join
+                  </button>
+                )}
+
+                {m.status === "awaiting_feedback" && (
+                  <button className="button" onClick={() => nav(`/rate/${m.id}`)}>
+                    Rate players
+                  </button>
+                )}
+              </div>
+
+              {isHost && isFull && m.status === "scheduled" && (
+                <>
+                  <div className="hr" />
+                  <p className="muted">Host tools</p>
+
+                  <div className="row">
+                    <button className="button secondary" onClick={() => setTeamsSimple(m)}>
+                      Set teams (simple order)
+                    </button>
+                  </div>
+
+                  <div className="row" style={{ marginTop: 10 }}>
+                    <button className="button" onClick={() => complete(m, "A")}>Complete: A wins</button>
+                    <button className="button secondary" onClick={() => complete(m, "B")}>Complete: B wins</button>
+                    <button className="button secondary" onClick={() => complete(m, "tie")}>Complete: Tie</button>
+                  </div>
+                </>
+              )}
+            </div>
+          );
+        })
+      )}
+    </div>
+  );
+}

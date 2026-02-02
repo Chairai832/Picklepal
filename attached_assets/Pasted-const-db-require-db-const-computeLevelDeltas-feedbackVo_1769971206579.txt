@@ -1,0 +1,107 @@
+const db = require("./db");
+const {
+  computeLevelDeltas,
+  feedbackVoteToNumber,
+  applyFeedbackAdjustment,
+  clamp,
+} = require("./rating");
+
+function nowISO() {
+  return new Date().toISOString();
+}
+
+// Finalize if all participants submitted feedback OR deadline passed (force=true)
+function tryFinalizeMatch(matchId, { force = false } = {}) {
+  const match = db.prepare("SELECT * FROM matches WHERE id=?").get(matchId);
+  if (!match || match.status !== "awaiting_feedback") return { ok: false, reason: "not_awaiting" };
+
+  const deadlinePassed = match.feedback_deadline && Date.now() >= match.feedback_deadline;
+
+  if (!force && !deadlinePassed) {
+    const participantIds = db
+      .prepare("SELECT user_id FROM match_players WHERE match_id=?")
+      .all(matchId)
+      .map((r) => r.user_id);
+
+    // Early finalize only if each participant submitted at least 1 feedback row
+    const submitters = db
+      .prepare("SELECT DISTINCT from_user_id FROM player_feedback WHERE match_id=?")
+      .all(matchId)
+      .map((r) => r.from_user_id);
+
+    const allSubmitted = participantIds.every((id) => submitters.includes(id));
+    if (!allSubmitted) return { ok: false, reason: "waiting_for_feedback" };
+  }
+
+  const result = match.result_json
+    ? JSON.parse(match.result_json)
+    : { sets: [], winnerTeam: "A" };
+
+  const competitive = !!match.competitive;
+
+  const participants = db
+    .prepare(`
+      SELECT u.id, u.name, u.level, u.reliability_pct, mp.team
+      FROM match_players mp
+      JOIN users u ON u.id = mp.user_id
+      WHERE mp.match_id=?
+    `)
+    .all(matchId);
+
+  const teamA = participants.filter((p) => p.team === "A");
+  const teamB = participants.filter((p) => p.team === "B");
+  if (teamA.length !== 2 || teamB.length !== 2) return { ok: false, reason: "bad_teams" };
+
+  const outcomeForTeamA =
+    result.winnerTeam === "A" ? "win" :
+    result.winnerTeam === "B" ? "loss" : "tie";
+
+  const { deltas } = computeLevelDeltas({
+    competitive,
+    teamA: teamA.map((p) => ({ id: p.id, level: p.level, reliabilityPct: p.reliability_pct })),
+    teamB: teamB.map((p) => ({ id: p.id, level: p.level, reliabilityPct: p.reliability_pct })),
+    outcomeForTeamA,
+    sets: result.sets,
+  });
+
+  // Build feedback consensus avg per player [-1..+1]
+  const fbRows = db
+    .prepare("SELECT about_user_id, vote FROM player_feedback WHERE match_id=?")
+    .all(matchId);
+
+  const sums = new Map();
+  const counts = new Map();
+  for (const r of fbRows) {
+    const id = r.about_user_id;
+    sums.set(id, (sums.get(id) ?? 0) + feedbackVoteToNumber(r.vote));
+    counts.set(id, (counts.get(id) ?? 0) + 1);
+  }
+
+  const feedbackMap = new Map();
+  for (const [id, sum] of sums.entries()) {
+    feedbackMap.set(id, sum / (counts.get(id) || 1));
+  }
+
+  applyFeedbackAdjustment(deltas, feedbackMap);
+
+  const updUser = db.prepare("UPDATE users SET level=?, reliability_pct=? WHERE id=?");
+
+  for (const p of participants) {
+    const d = deltas.get(p.id) ?? 0;
+    const nextLevel = clamp(Number(p.level) + d, 0, 7);
+
+    // Reliability increases more when feedback is close to "correct" (consensus near 0)
+    const fb = feedbackMap.get(p.id) ?? 0;
+    const relGain = Math.abs(fb) < 0.3 ? 6 : 2;
+    const nextRel = clamp(Number(p.reliability_pct) + (competitive ? relGain : 0), 0, 100);
+
+    updUser.run(Number(nextLevel.toFixed(3)), Math.round(nextRel), p.id);
+  }
+
+  db.prepare("UPDATE matches SET status='finalized', finalized_at=? WHERE id=?")
+    .run(nowISO(), matchId);
+
+  return { ok: true };
+}
+
+module.exports = { tryFinalizeMatch };

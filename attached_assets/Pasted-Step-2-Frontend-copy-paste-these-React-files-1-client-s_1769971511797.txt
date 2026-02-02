@@ -1,0 +1,535 @@
+Step 2 — Frontend: copy/paste these React files
+1) client/src/lib/api.js
+const API_BASE = "/api";
+
+export function getToken() {
+  return localStorage.getItem("mp_token");
+}
+export function setToken(token) {
+  if (!token) localStorage.removeItem("mp_token");
+  else localStorage.setItem("mp_token", token);
+}
+export function getUser() {
+  const raw = localStorage.getItem("mp_user");
+  return raw ? JSON.parse(raw) : null;
+}
+export function setUser(user) {
+  if (!user) localStorage.removeItem("mp_user");
+  else localStorage.setItem("mp_user", JSON.stringify(user));
+}
+
+async function request(path, { method = "GET", body } = {}) {
+  const token = getToken();
+  const res = await fetch(`${API_BASE}${path}`, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.error || "Request failed");
+  return data;
+}
+
+export const api = {
+  meta: () => request("/meta"),
+  courts: (city) => request(`/courts${city ? `?city=${encodeURIComponent(city)}` : ""}`),
+
+  requestCode: (email) => request("/auth/request-code", { method: "POST", body: { email } }),
+  verifyCode: (payload) => request("/auth/verify-code", { method: "POST", body: payload }),
+
+  myBookings: () => request("/me/bookings"),
+  createBooking: (payload) => request("/bookings", { method: "POST", body: payload }),
+  cancelBooking: (id) => request(`/bookings/${id}`, { method: "DELETE" }),
+
+  matches: () => request("/matches"),
+  createMatch: (payload) => request("/matches", { method: "POST", body: payload }),
+  joinMatch: (id) => request(`/matches/${id}/join`, { method: "POST" }),
+  setTeams: (id, payload) => request(`/matches/${id}/set-teams`, { method: "POST", body: payload }),
+  completeMatch: (id, payload) => request(`/matches/${id}/complete`, { method: "POST", body: payload }),
+  submitFeedback: (id, payload) => request(`/matches/${id}/feedback`, { method: "POST", body: payload }),
+
+  createVenue: (payload) => request("/venues", { method: "POST", body: payload }),
+  myVenues: () => request("/me/venues"),
+  addCourt: (venueId, payload) => request(`/venues/${venueId}/courts`, { method: "POST", body: payload }),
+  venueBookings: () => request("/me/venue-bookings"),
+};
+
+2) client/src/App.jsx
+
+(If yours already has Courts/Bookings/Login/Venue, keep them; just ensure RatePlayers route exists.)
+
+import React from "react";
+import { Routes, Route, Navigate } from "react-router-dom";
+import Navbar from "./components/Navbar.jsx";
+
+import Courts from "./pages/Courts.jsx";
+import Matches from "./pages/Matches.jsx";
+import Bookings from "./pages/Bookings.jsx";
+import Login from "./pages/Login.jsx";
+import Venue from "./pages/Venue.jsx";
+import RatePlayers from "./pages/RatePlayers.jsx";
+
+import { getUser } from "./lib/api.js";
+
+function RequireAuth({ children }) {
+  const user = getUser();
+  if (!user) return <Navigate to="/login" replace />;
+  return children;
+}
+
+export default function App() {
+  return (
+    <div className="app">
+      <Navbar />
+      <main className="container">
+        <Routes>
+          <Route path="/" element={<Navigate to="/courts" replace />} />
+          <Route path="/login" element={<Login />} />
+          <Route path="/courts" element={<Courts />} />
+          <Route path="/matches" element={<Matches />} />
+          <Route
+            path="/bookings"
+            element={
+              <RequireAuth>
+                <Bookings />
+              </RequireAuth>
+            }
+          />
+          <Route
+            path="/venue"
+            element={
+              <RequireAuth>
+                <Venue />
+              </RequireAuth>
+            }
+          />
+          <Route
+            path="/rate/:id"
+            element={
+              <RequireAuth>
+                <RatePlayers />
+              </RequireAuth>
+            }
+          />
+          <Route path="*" element={<NotFound />} />
+        </Routes>
+      </main>
+    </div>
+  );
+}
+
+function NotFound() {
+  return (
+    <div className="card">
+      <h2>Page not found</h2>
+      <p className="muted">Try Courts or Open Matches.</p>
+    </div>
+  );
+}
+
+3) client/src/pages/Matches.jsx
+
+This file is the “control room” for doubles matches: join, teams, complete, navigate to rating.
+
+import React, { useEffect, useMemo, useState } from "react";
+import { api, getUser } from "../lib/api";
+import { useNavigate } from "react-router-dom";
+
+function todayISO() {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function isoFromLocal(date, time) {
+  return new Date(`${date}T${time}:00`).toISOString();
+}
+
+export default function Matches() {
+  const user = getUser();
+  const nav = useNavigate();
+
+  const [meta, setMeta] = useState(null);
+  const [courts, setCourts] = useState([]);
+  const [matches, setMatches] = useState([]);
+  const [err, setErr] = useState("");
+
+  // create form
+  const [city, setCity] = useState("");
+  const [courtId, setCourtId] = useState("");
+  const [title, setTitle] = useState("Open Pickleball Doubles");
+  const [skill, setSkill] = useState("Beginner");
+  const [date, setDate] = useState(todayISO());
+  const [time, setTime] = useState("19:00");
+  const [openSpots, setOpenSpots] = useState(3); // doubles: host + 3 open spots
+
+  useEffect(() => {
+    (async () => {
+      const m = await api.meta();
+      setMeta(m);
+      setCity(m.cities[0]);
+      setSkill(m.skills[0]);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!city) return;
+    (async () => {
+      const c = await api.courts(city);
+      setCourts(c);
+      setCourtId(c[0]?.id || "");
+    })();
+  }, [city]);
+
+  async function loadMatches() {
+    setErr("");
+    try {
+      const rows = await api.matches();
+      setMatches(rows);
+    } catch (e) {
+      setErr(e.message);
+    }
+  }
+
+  useEffect(() => {
+    loadMatches();
+  }, []);
+
+  const cityCourts = useMemo(() => courts, [courts]);
+
+  async function create() {
+    setErr("");
+    if (!user) return setErr("Please login to create a match.");
+    try {
+      await api.createMatch({
+        courtId,
+        title,
+        skill,
+        startsAt: isoFromLocal(date, time),
+        needPlayers: Number(openSpots), // 0..3
+      });
+      await loadMatches();
+      alert("Match created!");
+    } catch (e) {
+      setErr(e.message);
+    }
+  }
+
+  async function join(id) {
+    setErr("");
+    if (!user) return setErr("Please login to join.");
+    try {
+      await api.joinMatch(id);
+      await loadMatches();
+    } catch (e) {
+      setErr(e.message);
+    }
+  }
+
+  async function setTeamsSimple(m) {
+    // Simple rule: first 2 players => Team A, next 2 => Team B
+    const ids = (m.players || []).map(p => p.id);
+    if (ids.length !== 4) return;
+    await api.setTeams(m.id, { teamA: [ids[0], ids[1]], teamB: [ids[2], ids[3]] });
+    await loadMatches();
+  }
+
+  async function complete(m, winnerTeam) {
+    setErr("");
+    if (!user) return setErr("Please login.");
+    try {
+      // Demo sets (you can later build score input UI)
+      const sets =
+        winnerTeam === "A"
+          ? [[11, 8], [9, 11], [11, 6]]
+          : winnerTeam === "B"
+          ? [[8, 11], [11, 9], [6, 11]]
+          : [[11, 9], [9, 11]];
+
+      await api.completeMatch(m.id, {
+        competitive: true,
+        sets,
+        winnerTeam, // "A" | "B" | "tie"
+      });
+
+      await loadMatches();
+      nav(`/rate/${m.id}`);
+    } catch (e) {
+      setErr(e.message);
+    }
+  }
+
+  return (
+    <div className="grid">
+      <div className="col-12 card">
+        <h2 className="cardTitle">Open matches (Doubles)</h2>
+        <p className="muted">Doubles only: 4 players total. Host can set teams and complete match.</p>
+
+        <div className="hr" />
+
+        <div className="grid">
+          <div className="col-3">
+            <label className="muted">City</label>
+            <select className="select" value={city} onChange={(e) => setCity(e.target.value)}>
+              {meta?.cities?.map((c) => <option key={c} value={c}>{c}</option>)}
+            </select>
+          </div>
+
+          <div className="col-6">
+            <label className="muted">Court</label>
+            <select className="select" value={courtId} onChange={(e) => setCourtId(e.target.value)}>
+              {cityCourts.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name} — {c.venue.name} ({c.indoor ? "Indoor" : "Outdoor"})
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="col-3">
+            <label className="muted">Skill</label>
+            <select className="select" value={skill} onChange={(e) => setSkill(e.target.value)}>
+              {meta?.skills?.map((s) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+
+          <div className="col-6">
+            <label className="muted">Title</label>
+            <input className="input" value={title} onChange={(e) => setTitle(e.target.value)} />
+          </div>
+
+          <div className="col-3">
+            <label className="muted">Date</label>
+            <input className="input" type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+          </div>
+
+          <div className="col-3">
+            <label className="muted">Time</label>
+            <input className="input" type="time" value={time} onChange={(e) => setTime(e.target.value)} />
+          </div>
+
+          <div className="col-3">
+            <label className="muted">Open spots</label>
+            <input
+              className="input"
+              type="number"
+              min="0"
+              max="3"
+              value={openSpots}
+              onChange={(e) => setOpenSpots(e.target.value)}
+            />
+          </div>
+
+          <div className="col-9">
+            <label className="muted"> </label>
+            <div className="row">
+              <button className="button" onClick={create}>Create match</button>
+              <button className="button secondary" onClick={loadMatches}>Refresh</button>
+              <span className="pill">{user ? `Logged in: ${user.name}` : "Not logged in"}</span>
+            </div>
+          </div>
+        </div>
+
+        {err && <div className="error">{err}</div>}
+      </div>
+
+      {matches.map((m) => {
+        const players = m.players || [];
+        const isFull = players.length === 4;
+        const isHost = user && m.hostName === user.name;
+        const isJoined = user ? players.some(p => p.name === user.name) : false;
+
+        const teamA = players.filter(p => p.team === "A");
+        const teamB = players.filter(p => p.team === "B");
+
+        return (
+          <div key={m.id} className="col-6 card">
+            <h3 className="cardTitle">{m.title}</h3>
+            <p className="muted">
+              {m.city} • {m.venueName} • {m.courtName} • {new Date(m.startsAt).toLocaleString()}
+            </p>
+
+            <div className="pillRow">
+              <span className="pill">{m.skill}</span>
+              <span className="pill">Host: {m.hostName}</span>
+              <span className="pill">Status: {m.status}</span>
+            </div>
+
+            <div className="hr" />
+
+            <p className="muted">
+              Team A: {teamA.map(p => p.name).join(", ") || "—"}<br/>
+              Team B: {teamB.map(p => p.name).join(", ") || "—"}
+            </p>
+
+            <div className="row">
+              {!isJoined && m.status === "scheduled" && (
+                <button className="button" onClick={() => join(m.id)} disabled={players.length >= 4}>
+                  Join
+                </button>
+              )}
+
+              {m.status === "awaiting_feedback" && (
+                <button className="button secondary" onClick={() => nav(`/rate/${m.id}`)}>
+                  Rate players
+                </button>
+              )}
+            </div>
+
+            {isHost && isFull && m.status === "scheduled" && (
+              <>
+                <div className="hr" />
+                <p className="muted">Host tools</p>
+
+                <div className="row">
+                  <button className="button secondary" onClick={() => setTeamsSimple(m)}>
+                    Set teams (simple order)
+                  </button>
+                </div>
+
+                <div className="row" style={{ marginTop: 10 }}>
+                  <button className="button" onClick={() => complete(m, "A")}>Complete: Team A wins</button>
+                  <button className="button secondary" onClick={() => complete(m, "B")}>Complete: Team B wins</button>
+                  <button className="button secondary" onClick={() => complete(m, "tie")}>Complete: Tie</button>
+                </div>
+              </>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+4) client/src/pages/RatePlayers.jsx
+import React, { useEffect, useMemo, useState } from "react";
+import { api, getUser } from "../lib/api";
+import { useNavigate, useParams } from "react-router-dom";
+
+export default function RatePlayers() {
+  const { id } = useParams();
+  const matchId = Number(id);
+  const user = getUser();
+  const nav = useNavigate();
+
+  const [match, setMatch] = useState(null);
+  const [err, setErr] = useState("");
+  const [votes, setVotes] = useState({}); // aboutUserId -> vote
+
+  async function load() {
+    setErr("");
+    try {
+      const all = await api.matches();
+      const m = all.find((x) => x.id === matchId);
+      if (!m) throw new Error("Match not found");
+      setMatch(m);
+    } catch (e) {
+      setErr(e.message);
+    }
+  }
+
+  useEffect(() => {
+    load();
+  }, [matchId]);
+
+  const others = useMemo(() => {
+    if (!match || !user) return [];
+    return (match.players || []).filter((p) => p.name !== user.name);
+  }, [match, user]);
+
+  function setVote(aboutUserId, vote) {
+    setVotes((v) => ({ ...v, [aboutUserId]: vote }));
+  }
+
+  async function submit() {
+    setErr("");
+    try {
+      const payload = {
+        votes: Object.entries(votes).map(([aboutUserId, vote]) => ({
+          aboutUserId: Number(aboutUserId),
+          vote,
+        })),
+      };
+      await api.submitFeedback(matchId, payload);
+      nav("/matches");
+    } catch (e) {
+      setErr(e.message);
+    }
+  }
+
+  return (
+    <div className="grid">
+      <div className="col-12 card">
+        <h2 className="cardTitle">Rate players</h2>
+        <p className="muted">
+          Higher / Correct / Lower. You can skip — Match Point finalizes after 24 hours.
+        </p>
+
+        {err && <div className="error">{err}</div>}
+
+        <div className="hr" />
+
+        {!match ? (
+          <p className="muted">Loading…</p>
+        ) : (
+          <>
+            <div className="pillRow">
+              <span className="pill">{match.title}</span>
+              <span className="pill">{match.city}</span>
+              <span className="pill">{match.status}</span>
+            </div>
+
+            <div className="hr" />
+
+            <div className="grid">
+              {others.map((p) => (
+                <div key={p.id} className="col-6 card">
+                  <h3 className="cardTitle">{p.name}</h3>
+                  <p className="muted">Team {p.team}</p>
+
+                  <div className="row">
+                    <button
+                      className={"button " + (votes[p.id] === "higher" ? "" : "secondary")}
+                      onClick={() => setVote(p.id, "higher")}
+                    >
+                      Higher
+                    </button>
+                    <button
+                      className={"button " + (votes[p.id] === "correct" ? "" : "secondary")}
+                      onClick={() => setVote(p.id, "correct")}
+                    >
+                      Correct
+                    </button>
+                    <button
+                      className={"button " + (votes[p.id] === "lower" ? "" : "secondary")}
+                      onClick={() => setVote(p.id, "lower")}
+                    >
+                      Lower
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="hr" />
+
+            <div className="row">
+              <button className="button" onClick={submit} disabled={Object.keys(votes).length === 0}>
+                Submit ratings
+              </button>
+              <button className="button secondary" onClick={() => nav("/matches")}>
+                Skip
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}

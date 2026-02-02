@@ -1,0 +1,79 @@
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function reliabilityMultiplier(reliabilityPct) {
+  const r = clamp(Number(reliabilityPct ?? 0), 0, 100) / 100;
+  // low reliability => bigger swings; high reliability => smaller swings
+  return 1.0 - 0.8 * r; // 0% => 1.0, 100% => 0.2
+}
+
+function expectedScore(teamAvgA, teamAvgB) {
+  const kappa = 1.25;
+  const diff = (teamAvgA - teamAvgB) * kappa;
+  return 1 / (1 + Math.exp(-diff));
+}
+
+function actualScore(outcome) {
+  if (outcome === "win") return 1;
+  if (outcome === "loss") return 0;
+  return 0.5; // tie
+}
+
+function marginMultiplierFromSets(sets) {
+  if (!Array.isArray(sets) || sets.length === 0) return 1.0;
+  const diffs = sets.map(([a, b]) => Math.abs((a ?? 0) - (b ?? 0)));
+  const avgDiff = diffs.reduce((s, x) => s + x, 0) / diffs.length;
+  const m = 0.85 + (clamp(avgDiff, 0, 10) / 10) * 0.35; // 0.85..1.20
+  return clamp(m, 0.85, 1.20);
+}
+
+// teamA/teamB: [{id, level, reliabilityPct}]
+function computeLevelDeltas({ competitive, teamA, teamB, outcomeForTeamA, sets }) {
+  if (!competitive) {
+    return { deltas: new Map([...teamA, ...teamB].map((p) => [p.id, 0])) };
+  }
+
+  const avgA = teamA.reduce((s, p) => s + Number(p.level), 0) / teamA.length;
+  const avgB = teamB.reduce((s, p) => s + Number(p.level), 0) / teamB.length;
+
+  const E = expectedScore(avgA, avgB);
+  const S = actualScore(outcomeForTeamA);
+  const baseError = S - E;
+
+  // Tune this for speed of rating changes:
+  const K = 0.08;
+  const marginMult = marginMultiplierFromSets(sets);
+
+  const teamDeltaA = K * baseError * marginMult;
+  const teamDeltaB = -teamDeltaA;
+
+  const deltas = new Map();
+  for (const p of teamA) deltas.set(p.id, teamDeltaA * reliabilityMultiplier(p.reliabilityPct));
+  for (const p of teamB) deltas.set(p.id, teamDeltaB * reliabilityMultiplier(p.reliabilityPct));
+
+  return { deltas };
+}
+
+function feedbackVoteToNumber(vote) {
+  if (vote === "higher") return 1;
+  if (vote === "lower") return -1;
+  return 0;
+}
+
+function applyFeedbackAdjustment(deltas, feedbackMap) {
+  // Small correction toward peer consensus
+  const FEEDBACK_WEIGHT = 0.02; // tune 0.01..0.04
+  for (const [userId, score] of feedbackMap.entries()) {
+    const cur = deltas.get(userId) ?? 0;
+    deltas.set(userId, cur + score * FEEDBACK_WEIGHT);
+  }
+  return deltas;
+}
+
+module.exports = {
+  clamp,
+  computeLevelDeltas,
+  feedbackVoteToNumber,
+  applyFeedbackAdjustment,
+};

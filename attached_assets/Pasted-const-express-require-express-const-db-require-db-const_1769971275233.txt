@@ -1,0 +1,385 @@
+const express = require("express");
+const db = require("./db");
+const { signToken, requireAuth, requireRole } = require("./auth");
+const { tryFinalizeMatch } = require("./finalize");
+
+const router = express.Router();
+
+const CITIES = ["Bengaluru", "Mumbai", "Delhi NCR", "Hyderabad", "Pune"];
+const SKILLS = ["Beginner", "Intermediate", "Advanced"];
+
+function nowISO() {
+  return new Date().toISOString();
+}
+
+// ---------------- AUTH (demo OTP; code is printed in server logs) ----------------
+router.post("/auth/request-code", (req, res) => {
+  const { email } = req.body || {};
+  if (!email || !String(email).includes("@")) return res.status(400).json({ error: "Valid email required" });
+
+  const code = String(Math.floor(100000 + Math.random() * 900000));
+  const expiresAt = Date.now() + 10 * 60 * 1000;
+
+  db.prepare(`
+    INSERT INTO login_codes (email, code, expires_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(email) DO UPDATE SET code=excluded.code, expires_at=excluded.expires_at
+  `).run(email.toLowerCase(), code, expiresAt);
+
+  console.log(`[Match Point] Login code for ${email}: ${code} (10 min)`);
+
+  res.json({ ok: true, message: "Code generated (check server logs in Replit)" });
+});
+
+router.post("/auth/verify-code", (req, res) => {
+  const { email, code, name, role } = req.body || {};
+  if (!email || !code) return res.status(400).json({ error: "Email + code required" });
+
+  const row = db.prepare("SELECT * FROM login_codes WHERE email=?").get(email.toLowerCase());
+  if (!row) return res.status(400).json({ error: "No code requested" });
+  if (row.code !== String(code)) return res.status(400).json({ error: "Wrong code" });
+  if (Date.now() > row.expires_at) return res.status(400).json({ error: "Code expired" });
+
+  db.prepare("DELETE FROM login_codes WHERE email=?").run(email.toLowerCase());
+
+  const finalRole = role === "venue" ? "venue" : "player";
+  const finalName = (name && String(name).trim()) ? String(name).trim() : "Player";
+
+  let user = db.prepare("SELECT * FROM users WHERE email=?").get(email.toLowerCase());
+  if (!user) {
+    const ins = db.prepare("INSERT INTO users (email, name, role, created_at) VALUES (?, ?, ?, ?)")
+      .run(email.toLowerCase(), finalName, finalRole, nowISO());
+    user = db.prepare("SELECT * FROM users WHERE id=?").get(ins.lastInsertRowid);
+  }
+
+  const token = signToken(user);
+  res.json({ token, user: { id: user.id, email: user.email, name: user.name, role: user.role } });
+});
+
+// ---------------- META ----------------
+router.get("/meta", (req, res) => {
+  res.json({ cities: CITIES, skills: SKILLS, sport: "pickleball", brand: "Match Point" });
+});
+
+// ---------------- COURTS ----------------
+router.get("/courts", (req, res) => {
+  const { city = "" } = req.query;
+
+  const rows = db.prepare(`
+    SELECT
+      courts.id as court_id,
+      courts.name as court_name,
+      courts.indoor,
+      courts.price_per_hour,
+      venues.id as venue_id,
+      venues.name as venue_name,
+      venues.city,
+      venues.area
+    FROM courts
+    JOIN venues ON venues.id = courts.venue_id
+    WHERE (? = '' OR venues.city = ?)
+    ORDER BY venues.city, venues.name, courts.name
+  `).all(String(city), String(city));
+
+  res.json(rows.map(r => ({
+    id: r.court_id,
+    name: r.court_name,
+    indoor: !!r.indoor,
+    pricePerHour: r.price_per_hour,
+    venue: { id: r.venue_id, name: r.venue_name, city: r.city, area: r.area }
+  })));
+});
+
+// ---------------- BOOKINGS ----------------
+router.get("/me/bookings", requireAuth, (req, res) => {
+  const rows = db.prepare(`
+    SELECT
+      bookings.id,
+      bookings.starts_at,
+      bookings.created_at,
+      courts.name as court_name,
+      courts.price_per_hour,
+      venues.name as venue_name,
+      venues.city,
+      venues.area
+    FROM bookings
+    JOIN courts ON courts.id = bookings.court_id
+    JOIN venues ON venues.id = courts.venue_id
+    WHERE bookings.user_id = ?
+    ORDER BY bookings.starts_at DESC
+  `).all(req.user.id);
+
+  res.json(rows);
+});
+
+router.post("/bookings", requireAuth, (req, res) => {
+  const { courtId, startsAt } = req.body || {};
+  if (!courtId || !startsAt) return res.status(400).json({ error: "courtId + startsAt required" });
+
+  const existing = db.prepare("SELECT id FROM bookings WHERE court_id=? AND starts_at=?").get(courtId, startsAt);
+  if (existing) return res.status(409).json({ error: "That slot is already booked" });
+
+  const ins = db.prepare("INSERT INTO bookings (user_id, court_id, starts_at, created_at) VALUES (?, ?, ?, ?)")
+    .run(req.user.id, courtId, String(startsAt), nowISO());
+
+  res.json({ id: ins.lastInsertRowid, ok: true });
+});
+
+router.delete("/bookings/:id", requireAuth, (req, res) => {
+  const id = Number(req.params.id);
+  const row = db.prepare("SELECT * FROM bookings WHERE id=?").get(id);
+  if (!row) return res.status(404).json({ error: "Not found" });
+  if (row.user_id !== req.user.id) return res.status(403).json({ error: "Forbidden" });
+
+  db.prepare("DELETE FROM bookings WHERE id=?").run(id);
+  res.json({ ok: true });
+});
+
+// ---------------- MATCHES (doubles only) ----------------
+
+// List matches with players [{id,name,team}]
+router.get("/matches", (req, res) => {
+  const rows = db.prepare(`
+    SELECT
+      m.id, m.title, m.skill, m.starts_at, m.need_players, m.status,
+      m.competitive, m.feedback_deadline,
+      u.name as host_name,
+      c.name as court_name,
+      v.city, v.area, v.name as venue_name
+    FROM matches m
+    JOIN users u ON u.id = m.host_user_id
+    JOIN courts c ON c.id = m.court_id
+    JOIN venues v ON v.id = c.venue_id
+    ORDER BY m.starts_at ASC
+  `).all();
+
+  const players = db.prepare(`
+    SELECT mp.match_id, mp.team, u.id as user_id, u.name
+    FROM match_players mp
+    JOIN users u ON u.id = mp.user_id
+  `).all();
+
+  const byMatch = new Map();
+  for (const p of players) {
+    if (!byMatch.has(p.match_id)) byMatch.set(p.match_id, []);
+    byMatch.get(p.match_id).push({ id: p.user_id, name: p.name, team: p.team });
+  }
+
+  res.json(rows.map(r => ({
+    id: r.id,
+    title: r.title,
+    skill: r.skill,
+    startsAt: r.starts_at,
+    needPlayers: r.need_players,
+    status: r.status,
+    competitive: !!r.competitive,
+    feedbackDeadline: r.feedback_deadline,
+    hostName: r.host_name,
+    courtName: r.court_name,
+    venueName: r.venue_name,
+    city: r.city,
+    area: r.area,
+    players: (byMatch.get(r.id) || []).sort((a,b) => a.team.localeCompare(b.team)),
+  })));
+});
+
+// Create match: host joins Team A; open spots 0..3
+router.post("/matches", requireAuth, (req, res) => {
+  const { courtId, title, skill, startsAt, needPlayers } = req.body || {};
+  if (!courtId || !title || !skill || !startsAt) {
+    return res.status(400).json({ error: "courtId,title,skill,startsAt required" });
+  }
+
+  const openSpots = Number(needPlayers ?? 3);
+  if (openSpots < 0 || openSpots > 3) return res.status(400).json({ error: "needPlayers must be 0..3" });
+
+  const ins = db.prepare(`
+    INSERT INTO matches (host_user_id, court_id, title, skill, starts_at, need_players, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(req.user.id, courtId, String(title), String(skill), String(startsAt), openSpots, nowISO());
+
+  const matchId = ins.lastInsertRowid;
+
+  db.prepare("INSERT INTO match_players (match_id, user_id, team) VALUES (?, ?, 'A')")
+    .run(matchId, req.user.id);
+
+  res.json({ id: matchId, ok: true });
+});
+
+// Join match until 4 players; auto-balance teams
+router.post("/matches/:id/join", requireAuth, (req, res) => {
+  const id = Number(req.params.id);
+  const match = db.prepare("SELECT * FROM matches WHERE id=?").get(id);
+  if (!match) return res.status(404).json({ error: "Match not found" });
+  if (match.status !== "scheduled") return res.status(400).json({ error: "Match not open" });
+
+  const players = db.prepare("SELECT user_id, team FROM match_players WHERE match_id=?").all(id);
+  if (players.find(p => p.user_id === req.user.id)) return res.json({ ok: true });
+
+  if (players.length >= 4) return res.status(409).json({ error: "Match is full (doubles)" });
+
+  const countA = players.filter(p => p.team === "A").length;
+  const countB = players.filter(p => p.team === "B").length;
+  const team = countA <= countB ? "A" : "B";
+
+  db.prepare("INSERT INTO match_players (match_id, user_id, team) VALUES (?, ?, ?)")
+    .run(id, req.user.id, team);
+
+  res.json({ ok: true });
+});
+
+// Host sets teams explicitly (2 ids in A, 2 ids in B)
+router.post("/matches/:id/set-teams", requireAuth, (req, res) => {
+  const id = Number(req.params.id);
+  const { teamA, teamB } = req.body || {};
+  if (!Array.isArray(teamA) || !Array.isArray(teamB) || teamA.length !== 2 || teamB.length !== 2) {
+    return res.status(400).json({ error: "teamA and teamB must be arrays of 2 userIds each" });
+  }
+
+  const match = db.prepare("SELECT * FROM matches WHERE id=?").get(id);
+  if (!match) return res.status(404).json({ error: "Match not found" });
+  if (match.host_user_id !== req.user.id) return res.status(403).json({ error: "Only host can set teams" });
+  if (match.status !== "scheduled") return res.status(400).json({ error: "Cannot set teams now" });
+
+  const players = db.prepare("SELECT user_id FROM match_players WHERE match_id=?").all(id).map(r => r.user_id);
+  if (players.length !== 4) return res.status(400).json({ error: "Doubles requires 4 players" });
+
+  const all = [...teamA, ...teamB].map(Number);
+  const uniq = new Set(all);
+  if (uniq.size !== 4) return res.status(400).json({ error: "Players must be unique" });
+
+  for (const uid of uniq) {
+    if (!players.includes(uid)) return res.status(400).json({ error: "Team contains non-participant" });
+  }
+
+  const upd = db.prepare("UPDATE match_players SET team=? WHERE match_id=? AND user_id=?");
+  for (const uid of teamA) upd.run("A", id, Number(uid));
+  for (const uid of teamB) upd.run("B", id, Number(uid));
+
+  res.json({ ok: true });
+});
+
+// Host completes match => awaiting_feedback + 24h deadline
+router.post("/matches/:id/complete", requireAuth, (req, res) => {
+  const id = Number(req.params.id);
+  const { competitive = true, sets = [], winnerTeam = "A" } = req.body || {};
+  if (!["A", "B", "tie"].includes(winnerTeam)) return res.status(400).json({ error: "winnerTeam must be A, B, or tie" });
+
+  const match = db.prepare("SELECT * FROM matches WHERE id=?").get(id);
+  if (!match) return res.status(404).json({ error: "Match not found" });
+  if (match.host_user_id !== req.user.id) return res.status(403).json({ error: "Only host can complete" });
+  if (match.status !== "scheduled") return res.status(400).json({ error: "Already completed" });
+
+  const players = db.prepare("SELECT user_id, team FROM match_players WHERE match_id=?").all(id);
+  if (players.length !== 4) return res.status(400).json({ error: "Doubles requires 4 players" });
+
+  const countA = players.filter(p => p.team === "A").length;
+  const countB = players.filter(p => p.team === "B").length;
+  if (countA !== 2 || countB !== 2) return res.status(400).json({ error: "Teams must be 2v2" });
+
+  const deadline = Date.now() + 24 * 60 * 60 * 1000;
+  const resultJson = { sets, winnerTeam };
+
+  db.prepare(`
+    UPDATE matches
+    SET competitive=?, status='awaiting_feedback', result_json=?, feedback_deadline=?
+    WHERE id=?
+  `).run(competitive ? 1 : 0, JSON.stringify(resultJson), deadline, id);
+
+  res.json({ ok: true, status: "awaiting_feedback", feedbackDeadline: deadline });
+});
+
+// Submit peer feedback (Higher/Correct/Lower)
+router.post("/matches/:id/feedback", requireAuth, (req, res) => {
+  const matchId = Number(req.params.id);
+  const { votes } = req.body || {};
+  if (!Array.isArray(votes)) return res.status(400).json({ error: "votes array required" });
+
+  const match = db.prepare("SELECT * FROM matches WHERE id=?").get(matchId);
+  if (!match) return res.status(404).json({ error: "Match not found" });
+  if (match.status !== "awaiting_feedback") return res.status(400).json({ error: "Not awaiting feedback" });
+
+  const isParticipant = db.prepare("SELECT 1 FROM match_players WHERE match_id=? AND user_id=?")
+    .get(matchId, req.user.id);
+  if (!isParticipant) return res.status(403).json({ error: "Only participants can submit feedback" });
+
+  const stmt = db.prepare(`
+    INSERT INTO player_feedback (match_id, from_user_id, about_user_id, vote, created_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(match_id, from_user_id, about_user_id) DO UPDATE SET vote=excluded.vote
+  `);
+
+  const now = nowISO();
+  for (const v of votes) {
+    const about = Number(v.aboutUserId);
+    const vote = String(v.vote);
+    if (!about || !["higher","correct","lower"].includes(vote)) return res.status(400).json({ error: "Invalid vote" });
+    if (about === req.user.id) continue;
+    stmt.run(matchId, req.user.id, about, vote, now);
+  }
+
+  // Early finalize if all players submitted (Option B still allows early finalize)
+  tryFinalizeMatch(matchId, { force: false });
+
+  res.json({ ok: true });
+});
+
+// ---------------- VENUE ONBOARDING ----------------
+router.post("/venues", requireAuth, requireRole("venue"), (req, res) => {
+  const { name, city, area, phone } = req.body || {};
+  if (!name || !city) return res.status(400).json({ error: "name + city required" });
+
+  const ins = db.prepare(`
+    INSERT INTO venues (owner_user_id, name, city, area, phone, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(req.user.id, String(name), String(city), area ? String(area) : null, phone ? String(phone) : null, nowISO());
+
+  res.json({ id: ins.lastInsertRowid, ok: true });
+});
+
+router.get("/me/venues", requireAuth, requireRole("venue"), (req, res) => {
+  const rows = db.prepare("SELECT * FROM venues WHERE owner_user_id=? ORDER BY created_at DESC").all(req.user.id);
+  res.json(rows);
+});
+
+router.post("/venues/:id/courts", requireAuth, requireRole("venue"), (req, res) => {
+  const venueId = Number(req.params.id);
+  const venue = db.prepare("SELECT * FROM venues WHERE id=?").get(venueId);
+  if (!venue) return res.status(404).json({ error: "Venue not found" });
+  if (venue.owner_user_id !== req.user.id) return res.status(403).json({ error: "Forbidden" });
+
+  const { name, indoor, pricePerHour } = req.body || {};
+  if (!name) return res.status(400).json({ error: "Court name required" });
+
+  const ins = db.prepare(`
+    INSERT INTO courts (venue_id, name, indoor, price_per_hour, created_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(venueId, String(name), indoor ? 1 : 0, Number(pricePerHour || 0), nowISO());
+
+  res.json({ id: ins.lastInsertRowid, ok: true });
+});
+
+router.get("/me/venue-bookings", requireAuth, requireRole("venue"), (req, res) => {
+  const rows = db.prepare(`
+    SELECT
+      bookings.id,
+      bookings.starts_at,
+      bookings.created_at,
+      users.name as player_name,
+      users.email as player_email,
+      courts.name as court_name,
+      venues.name as venue_name,
+      venues.city,
+      venues.area
+    FROM bookings
+    JOIN courts ON courts.id = bookings.court_id
+    JOIN venues ON venues.id = courts.venue_id
+    JOIN users ON users.id = bookings.user_id
+    WHERE venues.owner_user_id = ?
+    ORDER BY bookings.starts_at DESC
+  `).all(req.user.id);
+
+  res.json(rows);
+});
+
+module.exports = router;

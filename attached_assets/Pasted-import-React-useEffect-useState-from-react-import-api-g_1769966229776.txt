@@ -1,0 +1,158 @@
+import React, { useEffect, useState } from "react";
+import { api, getUser } from "../lib/api";
+
+export default function Venue() {
+  const user = getUser();
+  const [venues, setVenues] = useState([]);
+  const [bookings, setBookings] = useState([]);
+  const [err, setErr] = useState("");
+
+  const [vName, setVName] = useState("");
+  const [vCity, setVCity] = useState("Bengaluru");
+  const [vArea, setVArea] = useState("");
+  const [vPhone, setVPhone] = useState("");
+
+  const [selectedVenueId, setSelectedVenueId] = useState("");
+  const [cName, setCName] = useState("");
+  const [cIndoor, setCIndoor] = useState(false);
+  const [cPrice, setCPrice] = useState(700);
+
+  async function load() {
+    setErr("");
+    try {
+      const myV = await api.myVenues();
+      setVenues(myV);
+      setSelectedVenueId(myV[0]?.id ? String(myV[0].id) : "");
+      const b = await api.venueBookings();
+      setBookings(b);
+    } catch (e) {
+      setErr(e.message);
+    }
+  }
+
+  useEffect(() => { load(); }, []);
+
+  async function createVenue() {
+    setErr("");
+    try {
+      await api.createVenue({ name: vName, city: vCity, area: vArea, phone: vPhone });
+      setVName(""); setVArea(""); setVPhone("");
+      await load();
+      alert("Venue created!");
+    } catch (e) {
+      setErr(e.message);
+    }
+  }
+
+  async function addCourt() {
+    setErr("");
+    try {
+      await api.addCourt(selectedVenueId, { name: cName, indoor: cIndoor, pricePerHour: Number(cPrice) });
+      setCName(""); setCIndoor(false);
+      await load();
+      alert("Court added!");
+    } catch (e) {
+      setErr(e.message);
+    }
+  }
+
+  if (user?.role !== "venue") {
+    return (
+      <div className="card">
+        <h2 className="cardTitle">Venue dashboard</h2>
+        <p className="muted">This area is for venue accounts. Login as “Venue”.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="grid">
+      <div className="col-12 card">
+        <h2 className="cardTitle">Venue dashboard</h2>
+        <p className="muted">Create venues, add courts, and view bookings.</p>
+        {err && <div className="error">{err}</div>}
+      </div>
+
+      <div className="col-6 card">
+        <h3 className="cardTitle">Create a venue</h3>
+        <div className="grid">
+          <div className="col-12">
+            <label className="muted">Venue name</label>
+            <input className="input" value={vName} onChange={(e) => setVName(e.target.value)} placeholder="e.g. Indiranagar Pickleball Club" />
+          </div>
+          <div className="col-6">
+            <label className="muted">City</label>
+            <select className="select" value={vCity} onChange={(e) => setVCity(e.target.value)}>
+              <option>Bengaluru</option><option>Mumbai</option><option>Delhi NCR</option><option>Hyderabad</option><option>Pune</option>
+            </select>
+          </div>
+          <div className="col-6">
+            <label className="muted">Area</label>
+            <input className="input" value={vArea} onChange={(e) => setVArea(e.target.value)} placeholder="Indiranagar" />
+          </div>
+          <div className="col-12">
+            <label className="muted">Phone</label>
+            <input className="input" value={vPhone} onChange={(e) => setVPhone(e.target.value)} placeholder="Optional" />
+          </div>
+          <div className="col-12">
+            <button className="button" onClick={createVenue} disabled={!vName}>Create venue</button>
+          </div>
+        </div>
+      </div>
+
+      <div className="col-6 card">
+        <h3 className="cardTitle">Add a court</h3>
+        <div className="grid">
+          <div className="col-12">
+            <label className="muted">Select venue</label>
+            <select className="select" value={selectedVenueId} onChange={(e) => setSelectedVenueId(e.target.value)}>
+              <option value="">— choose —</option>
+              {venues.map((v) => <option key={v.id} value={v.id}>{v.name} ({v.city})</option>)}
+            </select>
+          </div>
+          <div className="col-12">
+            <label className="muted">Court name</label>
+            <input className="input" value={cName} onChange={(e) => setCName(e.target.value)} placeholder="Court 1" />
+          </div>
+          <div className="col-6">
+            <label className="muted">Indoor?</label>
+            <select className="select" value={cIndoor ? "yes" : "no"} onChange={(e) => setCIndoor(e.target.value === "yes")}>
+              <option value="no">Outdoor</option>
+              <option value="yes">Indoor</option>
+            </select>
+          </div>
+          <div className="col-6">
+            <label className="muted">Price/hour (₹)</label>
+            <input className="input" type="number" value={cPrice} onChange={(e) => setCPrice(e.target.value)} />
+          </div>
+          <div className="col-12">
+            <button className="button" onClick={addCourt} disabled={!selectedVenueId || !cName}>Add court</button>
+          </div>
+        </div>
+      </div>
+
+      <div className="col-12 card">
+        <h3 className="cardTitle">Bookings on your courts</h3>
+        <div className="hr" />
+        {bookings.length === 0 ? (
+          <p className="muted">No bookings yet.</p>
+        ) : (
+          <div className="grid">
+            {bookings.map((b) => (
+              <div key={b.id} className="col-6 card">
+                <h4 className="cardTitle">{b.venue_name} — {b.court_name}</h4>
+                <p className="muted">
+                  {b.city} • {new Date(b.starts_at).toLocaleString()}
+                </p>
+                <div className="pillRow">
+                  <span className="pill">{b.player_name}</span>
+                  <span className="pill">{b.player_email}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,194 @@
+✅ Step 1 — Build the React frontend
+
+In the Replit Shell, run:
+
+cd client
+npm run build
+
+
+This creates:
+
+client/dist/
+
+
+That folder is your production-ready frontend.
+
+✅ Step 2 — Make Express serve the frontend
+
+Your backend already has this part:
+
+const clientDist = path.join(__dirname, "..", "client", "dist");
+app.use(express.static(clientDist));
+
+app.get("*", (req, res) => {
+  res.sendFile(path.join(clientDist, "index.html"));
+});
+
+
+✅ That means when deployed, Express will serve your React app.
+
+✅ Step 3 — Change Replit to run ONLY the backend
+
+Right now you’re using:
+
+npm run dev
+
+
+That runs two servers:
+
+React dev server (5173)
+
+Express API server (3000)
+
+But deployment needs ONE server.
+
+Update your root package.json
+
+Make sure scripts look like:
+
+"scripts": {
+  "dev": "concurrently \"nodemon server/index.js\" \"npm --prefix client run dev -- --host 0.0.0.0 --port 5173\"",
+  "build": "npm --prefix client run build",
+  "start": "node server/index.js"
+}
+
+
+✅ Deployment uses npm start
+
+✅ Step 4 — Configure Replit Deployment
+Click:
+
+✅ Deploy button (top right)
+
+Then:
+
+Choose:
+
+✅ Autoscale Deployment
+
+Replit will ask:
+
+Run Command
+
+Put:
+
+npm start
+
+
+✅ This runs only Express, which serves:
+
+React frontend
+
+API backend
+
+✅ Step 5 — Deploy!
+
+Click:
+
+✅ Deploy
+
+Replit will generate a public URL like:
+
+https://match-point.yourname.repl.co
+
+
+Now anyone can open your app.
+
+✅ Step 6 — Testing with Fake Users
+
+Once deployed:
+
+Open 4 browser windows:
+
+Chrome normal
+
+Chrome Incognito
+
+Firefox
+
+Safari
+
+Then:
+
+Login with 4 different emails
+
+Create/join matches
+
+Complete match
+
+Submit feedback
+
+✅ Now you are testing multi-user behavior.
+
+✅ Important Notes for Replit Deployment
+✅ OTP Codes Still Work
+
+Since OTP prints in logs:
+
+Go to Replit Console logs
+
+Copy the login code
+
+Later you replace this with SMS/WhatsApp.
+
+✅ Database Persistence Warning
+
+Your SQLite file:
+
+server/matchpoint.sqlite
+
+
+Will persist in Replit unless:
+
+you reset the repl
+
+you redeploy fresh
+
+For serious beta users, switch to Postgres later.
+
+✅ Common Deployment Problems (and Fixes)
+Problem: Blank page after deploy
+
+✅ Cause: You forgot to build React
+
+Fix:
+
+cd client
+npm run build
+
+
+Then redeploy.
+
+Problem: API works locally but fails deployed
+
+✅ Cause: Frontend calling wrong URL
+
+Fix: Your frontend should use:
+
+const API_BASE = "/api";
+
+
+NOT:
+
+http://localhost:3000/api
+
+
+You already did it correctly.
+
+Problem: React routes break on refresh
+
+Fix: Express must include:
+
+app.get("*", (req, res) => {
+  res.sendFile(path.join(clientDist, "index.html"));
+});
+
+
+✅ Already included.
+
+✅ Best Practice: One-Command Deploy Workflow
+
+Whenever you want to redeploy:
+
+npm run build
+npm start
